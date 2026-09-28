@@ -1,13 +1,23 @@
 """「小析易」Agent 基础框架（基于 OpenAI Agents SDK）。
 
-本模块封装四块能力，对应需求：
-1. Agent 构建：人设 instructions + 模型 + 工具注入            -> build_agent()
-2. 历史会话：SQLiteSession 持久化，重启进程后自动恢复        -> create_session()
-3. 流式输出：Runner.run_streamed 逐 token 返回事件          -> chat_streamed()
-4. 过程展示：思考链/reasoning、工具调用、最终答案全量渲染     -> _StreamRenderer
+四大能力：
+1. Agent 构建：人设 + 模型 + 工具                 -> build_agent()
+2. 历史会话：SQLiteSession 持久化                  -> create_session()
+3. 流式运行：Runner.run_streamed() 逐 token 出事件 -> chat_streamed()
+4. 过程渲染：按事件的类型字段分流                  -> _StreamRenderer
 
-事件分发只依赖 SDK 的两种事件类型，后续扩展（handoff 多 Agent、guardrail）
-只需在 chat_streamed 的事件循环里增加分支。
+渲染不依赖 isinstance，全部按事件自身的类型字段分流：
+
+- event.data.type（Responses API 原始流事件，Runner 原样转发）
+    - response.reasoning_summary_text.delta
+      response.reasoning_text.delta                  -> 🧠 思考链
+    - response.output_text.delta                     -> 💬 最终答案
+    - response.output_item.added（function_call）     -> 登记待打印的工具调用
+    - response.function_call_arguments.done           -> 🔧 打印工具调用与参数
+    - response.output_item.done（function_call）      -> 参数事件的兜底
+- event.name（SDK 运行项事件）
+    - tool_output                                    -> 📤 工具执行结果
+      （原始流里没有工具执行结果，只能从运行项事件拿）
 """
 from __future__ import annotations
 
@@ -16,11 +26,6 @@ import os
 from typing import Any
 
 from agents import Agent, ModelSettings, Runner, SQLiteSession
-from agents.stream_events import (
-    AgentUpdatedStreamEvent,
-    RawResponsesStreamEvent,
-    RunItemStreamEvent,
-)
 from rich.console import Console
 from rich.markup import escape
 
@@ -35,7 +40,7 @@ console = Console()
 # --------------------------------------------------------------------------- #
 # 默认配置（均可用环境变量 / CLI 参数覆盖）
 # --------------------------------------------------------------------------- #
-DEFAULT_MODEL = "gpt-5-mini"          # 推理模型才能展示「思考链」
+DEFAULT_MODEL = "gpt-5-mini"           # 推理模型才能展示「思考链」
 DEFAULT_DB = "conversation_history.db"  # 会话历史 SQLite 文件
 AGENT_NAME = "小析易"
 
@@ -52,6 +57,11 @@ AGENT_INSTRUCTIONS = """
 - 给出结论时说明依据（来自哪次考试、哪份数据）；
 - 信息不足时，主动向教师追问，而不是臆测。
 """.strip()
+
+# 思考链的原始事件类型（不同模型/版本会落在其一）
+_REASONING_TYPES = frozenset(
+    {"response.reasoning_summary_text.delta", "response.reasoning_text.delta"}
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -91,74 +101,79 @@ def create_session(session_id: str, db_path: str | None = None) -> SQLiteSession
 
 
 # --------------------------------------------------------------------------- #
-# 3+4. 流式运行 + 事件渲染
+# 4. 事件渲染器
 # --------------------------------------------------------------------------- #
 class _StreamRenderer:
-    """把 run_streamed 的事件流渲染为控制台输出。
-
-    渲染约定：
-    - 🧠 思考链（推理模型的 reasoning 摘要，dim 灰色）先流式打印；
-    - 💬 最终答案（response.output_text.delta）接着打印；
-    - 🔧 工具调用 / 📤 工具返回 在对应 run item 事件到达时打印。
-    """
+    """把流事件按类型分流渲染到控制台。"""
 
     def __init__(self) -> None:
         self._reasoning_open = False
         self._text_open = False
+        self._pending: dict[str, tuple[str, str | None]] = {}  # item_id -> (工具名, call_id)
+        self._printed: set[str] = set()                        # 已打印过调用的 item_id
+        self._names: dict[str, str] = {}                      # call_id -> 工具名
         self.tool_names: list[str] = []
-        # SDK 0.22.x 里 tool_output 事件不带工具名，用 call_id -> name 映射补全
-        self._call_names: dict[str, str] = {}
-        # Runner 开始时会发一次 AgentUpdatedStreamEvent，不算「切换」，跳过
-        self._agent_announced = False
 
-    # -- 思考链 --
-    def reasoning_delta(self, delta: str) -> None:
-        """流式打印一段推理摘要。"""
+    # -- reasoning：思考链 --
+    def reasoning(self, delta: str) -> None:
         if not self._reasoning_open:
             console.print("[dim]🧠 思考链：[/]", end="", soft_wrap=True)
             self._reasoning_open = True
         console.print(f"[dim]{escape(delta)}[/dim]", end="", soft_wrap=True)
 
-    # -- 最终答案 --
-    def text_delta(self, delta: str) -> None:
-        """流式打印一段最终答案。"""
+    # -- content：最终答案 --
+    def content(self, delta: str) -> None:
         if self._reasoning_open:
             self._close_reasoning()
         console.print(escape(delta), end="", soft_wrap=True)
         self._text_open = True
 
-    # -- 工具调用 --
-    def tool_called(self, name: str, arguments: str, call_id: str | None = None) -> None:
-        self._close_reasoning()          # 工具调用前结束思考/文本区块
+    # -- function call：工具调用 --
+    def call_started(self, item_id: str, name: str, call_id: str | None = None) -> None:
+        """response.output_item.added：登记工具名 + call_id，等参数到齐再打印。"""
+        self._pending[item_id] = (name, call_id)
+        if call_id:
+            self._names[call_id] = name
+
+    def call_done(
+        self,
+        item_id: str,
+        arguments: str,
+        name: str | None = None,
+        call_id: str | None = None,
+    ) -> None:
+        """response.function_call_arguments.done / output_item.done：打印工具调用。"""
+        if item_id in self._printed:
+            return  # 两个事件可能都到，只打印一次
+        tool = self._pending.pop(item_id, None)
+        tool_name = name or (tool[0] if tool else "工具")
+        call_id = call_id or (tool[1] if tool else None)
+        self._printed.add(item_id)
+        self._close_reasoning()
         self._close_text()
         if call_id:
-            self._call_names[call_id] = name
-        try:                             # 参数美化：单行/缩进均可读
+            self._names[call_id] = tool_name
+        try:  # 参数美化：解析失败时回落原始字符串
             pretty = json.dumps(json.loads(arguments), ensure_ascii=False)
         except (ValueError, TypeError):
             pretty = arguments
         console.print(
-            f"\n[cyan]🔧 调用工具[/] [bold cyan]{escape(name)}[/]"
-            f"[dim]({escape(pretty)})[/dim]",
+            f"\n[cyan]🔧 调用工具[/] [bold cyan]{escape(tool_name)}[/]"
+            f"[dim]({escape(str(pretty))})[/dim]",
             soft_wrap=True,
         )
-        self.tool_names.append(name)
+        self.tool_names.append(tool_name)
 
-    def tool_output(self, output: Any, call_id: str | None = None) -> None:
-        name = self._call_names.get(call_id or "", "工具")
+    def call_result(self, call_id: str | None, output: Any) -> None:
+        """tool_output 运行项事件：打印工具执行结果。"""
+        name = self._names.get(call_id or "", "工具")
+        text = output if isinstance(output, str) else json.dumps(output, ensure_ascii=False, default=str)
         console.print(
-            f"[green]📤 工具返回[/] [bold]{escape(name)}[/]: "
-            f"{escape(_stringify(output))}",
+            f"[green]📤 工具返回[/] [bold]{escape(name)}[/]: {escape(text)}",
             soft_wrap=True,
         )
 
-    # -- 生命周期 --
-    def agent_switched(self, name: str) -> None:
-        """多 Agent 切换提示（runner 起始的那个 agent 不算切换）。"""
-        if self._agent_announced:
-            console.print(f"[yellow]🤝 已切换 Agent → {escape(name)}[/]")
-        self._agent_announced = True
-
+    # -- 收尾 --
     def finish(self) -> None:
         self._close_reasoning()
         self._close_text()
@@ -174,24 +189,9 @@ class _StreamRenderer:
             self._text_open = False
 
 
-def _attr(obj: Any, name: str, default: Any = None) -> Any:
-    """兼容地从对象或 dict 上取属性。"""
-    if obj is None:
-        return default
-    if isinstance(obj, dict):
-        return obj.get(name, default)
-    return getattr(obj, name, default)
-
-
-def _stringify(value: Any) -> str:
-    """工具返回值统一转成可读字符串。"""
-    if isinstance(value, str):
-        return value
-    if value is None:
-        return "(无返回)"
-    return json.dumps(value, ensure_ascii=False, default=str)
-
-
+# --------------------------------------------------------------------------- #
+# 3. 流式运行
+# --------------------------------------------------------------------------- #
 async def chat_streamed(
     agent: Agent,
     user_input: str,
@@ -202,15 +202,19 @@ async def chat_streamed(
     返回该轮 assistant 的最终文本；出错时打印提示并返回空串。
     传入了 session 时，Runner 会自动把本轮 messages 追加进会话历史。
     """
-    renderer = _StreamRenderer()
+    r = _StreamRenderer()
     try:
         result = Runner.run_streamed(agent, input=user_input, session=session)
         async for event in result.stream_events():
-            _dispatch_event(event, renderer)
-        renderer.finish()
+            data = getattr(event, "data", None)  # 原始流事件才有 .data
+            if data is not None:
+                _render_raw_event(data, r)
+            elif getattr(event, "name", None) == "tool_output":
+                r.call_result(_call_id_of(event.item), getattr(event.item, "output", None))
+        r.finish()
         final = str(result.final_output or "")
     except Exception as exc:  # noqa: BLE001 - 统一兜底，保证 CLI 不崩
-        renderer.finish()
+        r.finish()
         console.print(f"[bold red]✗ 运行出错：[/]{escape(str(exc))}")
         console.print(
             "[yellow]提示：检查 OPENAI_API_KEY 是否有效；"
@@ -218,47 +222,35 @@ async def chat_streamed(
         )
         return ""
 
-    if renderer.tool_names:
+    if r.tool_names:
         console.print(
-            f"[dim]—— 本轮调用工具 {len(renderer.tool_names)} 次："
-            f"{', '.join(renderer.tool_names)} ——[/]"
+            f"[dim]—— 本轮调用工具 {len(r.tool_names)} 次：{', '.join(r.tool_names)} ——[/]"
         )
     return final
 
 
-def _dispatch_event(event: Any, renderer: _StreamRenderer) -> None:
-    """把单个流事件分派给渲染器。"""
-    # 原始 token 流：reasoning 摘要增量、答案文本增量
-    if isinstance(event, RawResponsesStreamEvent):
-        data = event.data
-        etype = getattr(data, "type", "")
-        delta = getattr(data, "delta", None)
-        if not delta:
-            return
-        if "reasoning" in etype:
-            renderer.reasoning_delta(delta)
-        elif etype == "response.output_text.delta":
-            renderer.text_delta(delta)
-        return
+def _render_raw_event(data: Any, r: _StreamRenderer) -> None:
+    """按 Responses API 原始事件 type 分流。"""
+    etype = getattr(data, "type", "")
+    item = getattr(data, "item", None)
 
-    # 结构化运行项：工具调用开始、工具返回、消息完成等
-    if isinstance(event, RunItemStreamEvent):
-        item = event.item
-        if event.name == "tool_called":
-            raw = _attr(item, "raw_item", None)
-            name = getattr(item, "tool_name", None) or _attr(raw, "name", None) or "?"
-            renderer.tool_called(
-                str(name),
-                _attr(raw, "arguments", "") or "",
-                call_id=_attr(raw, "call_id", None) or _attr(raw, "id", None),
-            )
-        elif event.name == "tool_output":
-            renderer.tool_output(
-                getattr(item, "output", None),
-                call_id=_attr(_attr(item, "raw_item", None), "call_id", None),
-            )
-        return
+    if etype in _REASONING_TYPES:
+        if delta := getattr(data, "delta", None):
+            r.reasoning(delta)
+    elif etype == "response.output_text.delta":
+        if delta := getattr(data, "delta", None):
+            r.content(delta)
+    elif etype == "response.output_item.added" and getattr(item, "type", "") == "function_call":
+        # 登记 name/call_id；参数在随后的 arguments.done / output_item.done 到齐
+        r.call_started(item.id, item.name, item.call_id)
+    elif etype == "response.function_call_arguments.done":
+        r.call_done(data.item_id, getattr(data, "arguments", "") or "")
+    elif etype == "response.output_item.done" and getattr(item, "type", "") == "function_call":
+        # 兜底：某些链路没有独立的 arguments.done 事件
+        r.call_done(item.id, getattr(item, "arguments", "") or "", item.name, item.call_id)
 
-    # 多 Agent 切换（handoff）
-    if isinstance(event, AgentUpdatedStreamEvent):
-        renderer.agent_switched(event.new_agent.name)
+
+def _call_id_of(item: Any) -> str | None:
+    """从工具输出项取 call_id（raw_item 可能是对象或 dict）。"""
+    raw = getattr(item, "raw_item", None)
+    return raw.get("call_id") if isinstance(raw, dict) else getattr(raw, "call_id", None)

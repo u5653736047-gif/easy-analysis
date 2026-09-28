@@ -1,16 +1,14 @@
 """冒烟测试：不需要真实 API Key，端到端验证 Agent 框架。
 
-原理：用 SDK 官方测试替身 ScriptedModel 编排确定的模型行为，
-走真实的 Runner.run_streamed 流式管线（含 reasoning 增量、工具调用执行、
-SQLiteSession 历史写入），渲染逻辑与线上完全一致。
+两层测试：
+1. test_event_dispatch   —— 单元级：用真实 openai 事件对象驱动 _render_raw_event，
+   验证按 event.data.type 分流渲染、工具调用去重、未知事件忽略；
+2. test_end_to_end       —— 端到端：SDK 官方 ScriptedModel 走真实流式管线
+   （reasoning 增量 / 工具真实执行 / SQLiteSession 历史写入），并捕获控制台
+   输出验证「本轮只打印一次工具调用」等渲染行为。
 
 运行：
     .venv/bin/python tests/smoke_test.py
-
-覆盖的验收点：
-1. 流式输出：🧠 思考链 -> 🔧 工具调用 -> 📤 工具返回 -> 💬 最终答案；
-2. 工具调用：框架真实执行工具，且工具输出进入下一轮模型输入；
-3. 历史会话：两轮对话后 session 中消息条数正确增长。
 """
 from __future__ import annotations
 
@@ -22,51 +20,148 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from openai.types.responses import ResponseReasoningItem
-from openai.types.responses.response_reasoning_item import Summary
+import agent_core
+from agent_core import _StreamRenderer, _render_raw_event, build_agent, chat_streamed, create_session
+from openai.types.responses import (
+    ResponseFunctionCallArgumentsDoneEvent,
+    ResponseFunctionToolCall,
+    ResponseOutputItemAddedEvent,
+    ResponseOutputItemDoneEvent,
+    ResponseReasoningSummaryTextDeltaEvent,
+    ResponseTextDeltaEvent,
+)
+from agents.stream_events import RawResponsesStreamEvent
+from openai.types.responses.response_created_event import ResponseCreatedEvent
+from openai.types.responses.response import Response
+from rich.console import Console
 
 from agents.testing import ScriptedModel, assistant_message, function_call
 
-from agent_core import build_agent, chat_streamed, create_session
+PASS, FAIL = "\033[32m✓\033[0m", "\033[31m✗\033[0m"
 
 
+class _Recorder(Console):
+    """记录所有 print 的 Console，用于断言渲染输出。"""
+
+    def __init__(self) -> None:
+        super().__init__(record=True, width=120, no_color=True)
+
+
+def _check(results: list, name: str, ok: bool, detail: str = "") -> None:
+    results.append((name, ok))
+    print(f"  {PASS if ok else FAIL} {name}" + (f" | {detail}" if detail else ""))
+
+
+# --------------------------------------------------------------------------- #
+# 1. 单元级：事件分发
+# --------------------------------------------------------------------------- #
+async def test_event_dispatch(results: list) -> None:
+    print("\n===== 单元级：_render_raw_event 分流 ===========================")
+    r = _StreamRenderer()
+    recorder = _Recorder()
+    original = agent_core.console
+    agent_core.console = recorder
+    try:
+        # reasoning delta
+        _render_raw_event(
+            ResponseReasoningSummaryTextDeltaEvent(
+                type="response.reasoning_summary_text.delta",
+                item_id="rs-1", output_index=0, summary_index=0,
+                delta="先统计成绩，再给结论", sequence_number=1,
+            ),
+            r,
+        )
+        # content delta
+        _render_raw_event(
+            ResponseTextDeltaEvent(
+                type="response.output_text.delta",
+                item_id="msg-1", output_index=0, content_index=0,
+                delta="同学你好", logprobs=[], sequence_number=2,
+            ),
+            r,
+        )
+        # function call：added -> arguments.done -> output_item.done（重复到达）
+        _render_raw_event(
+            ResponseOutputItemAddedEvent(
+                type="response.output_item.added", output_index=1, sequence_number=3,
+                item=ResponseFunctionToolCall(
+                    id="fc-1", call_id="call-1", name="get_current_time",
+                    arguments="", type="function_call",
+                ),
+            ),
+            r,
+        )
+        _render_raw_event(
+            ResponseFunctionCallArgumentsDoneEvent(
+                type="response.function_call_arguments.done",
+                item_id="fc-1", output_index=1, arguments="{}", sequence_number=4,
+            ),
+            r,
+        )
+        _render_raw_event(
+            ResponseOutputItemDoneEvent(
+                type="response.output_item.done", output_index=1, sequence_number=5,
+                item=ResponseFunctionToolCall(
+                    id="fc-1", call_id="call-1", name="get_current_time",
+                    arguments="{}", type="function_call",
+                ),
+            ),
+            r,
+        )
+        # 未知事件：不应报错、不应产生输出
+        _render_raw_event(
+            ResponseCreatedEvent(
+                type="response.created", response=Response(id="resp-1", object="response", created_at=0, model="gpt-5-mini", status="in_progress", output=[], parallel_tool_calls=False, tool_choice="auto", tools=[]), sequence_number=0,
+            ),
+            r,
+        )
+        r.call_result("call-1", "2026-01-01 12:00:00")
+        r.finish()
+    finally:
+        agent_core.console = original
+
+    text = recorder.export_text()
+    _check(results, "reasoning delta 渲染为思考链", "🧠 思考链" in text and "先统计成绩" in text)
+    _check(results, "content delta 渲染为答案", "同学你好" in text)
+    _check(results, "工具调用只打印一次（去重）", text.count("🔧 调用工具") == 1, f"出现 {text.count('🔧 调用工具')} 次")
+    _check(results, "工具调用带名称与参数", "get_current_time" in text and "({})" in text)
+    _check(results, "工具返回按 call_id 关联到工具名", "📤 工具返回" in text and "get_current_time: 2026-01-01" in text)
+    _check(results, "未知事件不产生输出", "response.created" not in text and "加工" not in text)
+    _check(results, "tool_names 记录一次", r.tool_names == ["get_current_time"], str(r.tool_names))
+
+
+# --------------------------------------------------------------------------- #
+# 2. 端到端：ScriptedModel 走真实流式管线
+# --------------------------------------------------------------------------- #
 def _scripted_model() -> ScriptedModel:
-    """编排三轮行为：思考+调工具 -> 给结论 -> 第二轮闲聊。"""
+    """编排三轮行为：思考+调工具 -> 给结论 -> 第二轮闲聊（不带工具）。"""
+    from openai.types.responses import ResponseReasoningItem
+    from openai.types.responses.response_reasoning_item import Summary
+
     return ScriptedModel(
         [
-            # 第一轮模型调用：思考链 + 工具调用
+            # 第一轮第一次调用：思考链 + 工具调用
             [
                 ResponseReasoningItem(
                     id="rs-1",
                     type="reasoning",
-                    summary=[
-                        Summary(
-                            text="老师给了 7 个学生的分数，先调工具统计成绩分布。",
-                            type="summary_text",
-                        )
-                    ],
+                    summary=[Summary(text="老师给了 7 个学生的分数，先调工具统计成绩分布。", type="summary_text")],
                 ),
-                function_call(
-                    "classroom_score_stats",
-                    {"scores": [88, 92, 59, 45, 76, 61, 95]},
-                    call_id="call-1",
-                ),
+                function_call("classroom_score_stats", {"scores": [88, 92, 59, 45, 76, 61, 95]}, call_id="call-1"),
             ],
-            # 第一轮第二轮模型调用（拿到工具结果后）：给结论
+            # 第一轮第二次调用（拿到工具结果后）：给结论
             [
                 ResponseReasoningItem(
                     id="rs-2",
                     type="reasoning",
-                    summary=[
-                        Summary(text="工具已返回平均分和及格率，可以汇总结论了。", type="summary_text")
-                    ],
+                    summary=[Summary(text="工具已返回平均分和及格率，可以汇总结论了。", type="summary_text")],
                 ),
                 assistant_message(
                     "本次考试平均分 73.7 分，及格率 71.4%。"
                     "低分段（45/59/61）集中在计算失误，建议针对计算类题型专项练习。"
                 ),
             ],
-            # 第二轮模型调用：不带工具，直接回答（验证历史会话仍在模型输入中）
+            # 第二轮：不带工具，直接回答（验证历史会话仍在模型输入中）
             [assistant_message("好的，上一轮的结论我仍然记得。")],
         ]
     )
@@ -81,44 +176,54 @@ def _inject_model(agent, model: ScriptedModel):
         return agent
 
 
-async def main() -> int:
-    failures: list[str] = []
-
-    def check(name: str, ok: bool, detail: str = "") -> None:
-        print(f"  {'✓' if ok else '✗'} {name}" + (f" | {detail}" if detail else ""))
-        if not ok:
-            failures.append(name)
-
+async def test_end_to_end(results: list) -> None:
+    print("\n===== 端到端：脚本模型 -> Runner.stream -> SQLiteSession ========")
     tmpdir = tempfile.mkdtemp(prefix="xiaoxiyi-smoke-")
-    db = str(Path(tmpdir) / "smoke.db")
-    session = create_session("smoke", db)
+    session = create_session("smoke", str(Path(tmpdir) / "smoke.db"))
 
+    original = agent_core.console
+    recorder = _Recorder()
+    agent_core.console = recorder
     agent = _inject_model(build_agent(), _scripted_model())
+    try:
+        final1 = await chat_streamed(
+            agent, "我上传了本次月考成绩：88, 92, 59, 45, 76, 61, 95，帮我分析一下", session
+        )
+        items_after_1 = len(await session.get_items())
+        final2 = await chat_streamed(agent, "你还记得刚才的分析结论吗？", session)
+        items_after_2 = len(await session.get_items())
+    finally:
+        agent_core.console = original
+    text = recorder.export_text()
 
-    print("\n===== 第一轮：包含工具调用 =====================================")
-    final1 = await chat_streamed(agent, "我上传了本次月考成绩：88, 92, 59, 45, 76, 61, 95，帮我分析一下", session)
-    check("第一轮返回了最终答案", bool(final1.strip()), final1[:40] + "...")
+    _check(results, "第一轮返回了最终答案", bool(final1.strip()))
+    _check(results, "第二轮返回了最终答案", bool(final2.strip()))
+    _check(results, "思考链出现", text.count("🧠 思考链") >= 2, f"{text.count('🧠 思考链')} 段")
+    _check(results, "本轮只打印一次工具调用（去重）", text.count("🔧 调用工具") == 1)
+    _check(results, "工具返回已展示", text.count("📤 工具返回") == 1 and "平均分" in text)
+    _check(results, "答案含工具统计结果", "73.7" in final1)
 
-    items = await session.get_items()
-    check("会话历史已写入（含 user/assistant 消息）", len(items) >= 4, f"{len(items)} 条")
-
-    # 工具真实执行过：第二轮模型调用（模型的第二次调用）的输入里应包含工具返回的 JSON
     model: ScriptedModel = agent.model
-    check("模型共被调用 2 次（工具调用前后）", len(model.calls) == 2, str(len(model.calls)))
-    if len(model.calls) >= 2:
-        tool_input = str(model.calls[-1].input)
-        check("工具输出已进入第二轮模型输入", "平均分" in tool_input and "73.71" in tool_input)
+    _check(results, "模型共被调用 3 次（工具前后 + 第二次会话）", len(model.calls) == 3, str(len(model.calls)))
+    tool_input = str(model.calls[1].input)
+    _check(results, "工具输出已进入第二轮模型输入", "73.71" in tool_input and "平均分" in tool_input)
+    second_input = str(model.calls[2].input)
+    _check(results, "第二轮模型输入包含第一轮历史", "帮我分析一下" in second_input and "专项练习" in second_input)
 
-    print("\n===== 第二轮：不带工具 + 历史会话 ==============================")
-    final2 = await chat_streamed(agent, "你还记得刚才的分析结论吗？", session)
-    check("第二轮返回了最终答案", bool(final2.strip()), final2[:40] + "...")
-    check("历史消息随轮次增长", len(await session.get_items()) >= len(items) + 2)
+    _check(results, "会话历史第一轮后已写入", items_after_1 >= 4, f"{items_after_1} 条")
+    _check(results, "历史消息随轮次增长", items_after_2 >= items_after_1 + 2, f"{items_after_1} -> {items_after_2}")
 
+
+async def main() -> int:
+    results: list = []
+    await test_event_dispatch(results)
+    await test_end_to_end(results)
     print("\n===== 结果 =====================================================")
-    if failures:
-        print(f"✗ 未通过：{failures}")
+    failed = [name for name, ok in results if not ok]
+    if failed:
+        print(f"{FAIL} 未通过 {len(failed)}/{len(results)}：{failed}")
         return 1
-    print("✓ 全部通过：流式输出 / 思考链 / 工具调用 / 历史会话 均正常工作")
+    print(f"{PASS} 全部通过（{len(results)} 项）：事件分流 / 去重 / 工具调用 / 历史会话 均正常")
     return 0
 
 
