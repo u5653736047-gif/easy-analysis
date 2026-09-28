@@ -1,9 +1,9 @@
 """错因分析工具测试：本地假 Jev 服务 + 工具逻辑 + 框架内端到端。
 
 运行：
-    .venv/bin/python tests/test_error_cause_tool.py
+    .venv/bin/python tests/test_jev_error_cause.py
 
-与 tests/test_jev_tool.py 同构：假服务返回编排好的响应，覆盖
+与 tests/test_jev_question_type.py 同构：假服务返回编排好的响应，覆盖
 - 正常路径（主错因 + 多因阈值过滤 + state 模板拼装 + 问题数量）；
 - 低置信/margin 过小/多因为空 -> needs_review；
 - 上游 5xx / 连接失败 -> source=error 降级；
@@ -25,7 +25,7 @@ from agent_core import AGENT_INSTRUCTIONS, AGENT_NAME, chat_streamed
 from agents import Agent, set_tracing_disabled
 from agents.testing import ScriptedModel, assistant_message, function_call
 from agents.tool import function_tool
-from error_cause_tool import (
+from jev.error_cause import (
     ERROR_CAUSES,
     MULTI_CAUSE_THRESHOLD,
     analyze_error_cause_raw,
@@ -90,19 +90,19 @@ def _resp(primary: str, conf: float, nouls: dict[str, float]) -> dict:
 
 def _impl_with_base(q: str, ref: str, ans: str, base_url: str) -> dict:
     """走真实实现体，但把请求打到假服务。"""
-    import error_cause_tool
+    from jev import error_cause as jev_ec
 
-    orig = error_cause_tool.analyze_error_cause_raw
-    error_cause_tool.analyze_error_cause_raw = (
+    orig = jev_ec.analyze_error_cause_raw
+    jev_ec.analyze_error_cause_raw = (
         lambda question, reference, student, *, api_key=None, **kw: orig(
             question, reference, student, api_key=api_key or "test-key",
             base_url=base_url, timeout=15,
         )
     )
     try:
-        return error_cause_tool.analyze_error_cause_impl(q, ref, ans)
+        return jev_ec.analyze_error_cause_impl(q, ref, ans)
     finally:
-        error_cause_tool.analyze_error_cause_raw = orig
+        jev_ec.analyze_error_cause_raw = orig
 
 
 async def test_tool_logic(results: list) -> None:
@@ -196,65 +196,59 @@ async def test_end_to_end(results: list) -> None:
     }
     url, server, received = start_fake_jev(lambda b: (200, _resp("计算失误", 0.85, nouls_full)))
     try:
-        @function_tool
-        def analyze_error_cause(question_text: str, reference_answer: str, student_answer: str) -> str:
-            """调用 Jev 分析一道学生错题的错因（测试替身，打本地假服务）。"""
-            import json as _json
+        # 直接复用生产工具：只把底层 *_raw 重定向到假服务
+        from jev import error_cause as jev_ec
 
-            r = analyze_error_cause_raw(
-                question_text, reference_answer, student_answer,
-                api_key="test-key", base_url=url, timeout=15,
+        orig_raw = jev_ec.analyze_error_cause_raw
+        jev_ec.analyze_error_cause_raw = (
+            lambda question, reference, student, *, api_key=None, **kw: orig_raw(
+                question, reference, student,
+                api_key=api_key or "test-key", base_url=url, timeout=15,
             )
-            import error_cause_tool
-
-            out = dict(r)
-            probs = sorted(r["probabilities"].values(), reverse=True)
-            out["margin"] = round(probs[0] - (probs[1] if len(probs) > 1 else 0.0), 4)
-            out["detected_causes"] = [
-                c for c in r["causes"] if c["probability"] >= error_cause_tool.MULTI_CAUSE_THRESHOLD
-            ]
-            out["needs_review"] = (
-                r["confidence"] < 0.70 or out["margin"] < 0.15 or not out["detected_causes"]
-            )
-            return _json.dumps(out, ensure_ascii=False)
-
-        model = ScriptedModel([
-            [
-                ResponseReasoningItem(
-                    id="rs-1", type="reasoning",
-                    summary=[Summary(text="调错因分析工具。", type="summary_text")],
-                ),
-                function_call(
-                    "analyze_error_cause",
-                    {"question_text": "解方程 2(x+1)=x-1", "reference_answer": "x=-3",
-                     "student_answer": "去括号得 2x+1=x-1，解得 x=0"},
-                    call_id="call-err-1",
-                ),
-            ],
-            [assistant_message("该生主要错因为计算失误（置信度0.85，无需复核），同时建议关注粗心标签。")],
-        ])
-        agent = Agent(
-            name=AGENT_NAME, model=model,
-            instructions=AGENT_INSTRUCTIONS,
-            tools=[analyze_error_cause],
         )
-
-        recorder = _Recorder()
-        original = agent_core.console
-        agent_core.console = recorder
         try:
-            final = await chat_streamed(
-                agent, "分析这道错题：题目「解方程 2(x+1)=x-1」，答案 x=-3，学生答 x=0"
+            model = ScriptedModel([
+                [
+                    ResponseReasoningItem(
+                        id="rs-1", type="reasoning",
+                        summary=[Summary(text="调错因分析工具。", type="summary_text")],
+                    ),
+                    function_call(
+                        "analyze_error_cause",
+                        {"question_text": "解方程 2(x+1)=x-1", "reference_answer": "x=-3",
+                         "student_answer": "去括号得 2x+1=x-1，解得 x=0"},
+                        call_id="call-err-1",
+                    ),
+                ],
+                [assistant_message("该生主要错因为计算失误（置信度0.85，无需复核），同时建议关注粗心标签。")],
+            ])
+            agent = Agent(
+                name=AGENT_NAME, model=model,
+                instructions=AGENT_INSTRUCTIONS,
+                tools=[jev_ec.analyze_error_cause],
             )
-        finally:
-            agent_core.console = original
-        text = recorder.export_text()
 
-        _check(results, "端到端：工具被真实调用", len(received) >= 1)
-        _check(results, "端到端：🔧 工具调用已渲染", "🔧 调用工具" in text and "analyze_error_cause" in text)
-        _check(results, "端到端：📤 工具返回已渲染", "📤 工具返回" in text and "计算失误" in text)
-        _check(results, "端到端：工具结果回传给模型", any("0.85" in str(c.input) for c in model.calls))
-        _check(results, "端到端：最终答案非空", bool((final or "").strip()))
+            recorder = _Recorder()
+            original = agent_core.console
+            agent_core.console = recorder
+            try:
+                final = await chat_streamed(
+                    agent, "分析这道错题：题目「解方程 2(x+1)=x-1」，答案 x=-3，学生答 x=0"
+                )
+            finally:
+                agent_core.console = original
+            text = recorder.export_text()
+
+            _check(results, "端到端：工具被真实调用", len(received) >= 1)
+            _check(results, "端到端：🔧 工具调用已渲染",
+                   "🔧 调用工具" in text and "analyze_error_cause" in text)
+            _check(results, "端到端：📤 工具返回已渲染",
+                   "📤 工具返回" in text and "计算失误" in text)
+            _check(results, "端到端：工具结果回传给模型",
+                   any("0.85" in str(c.input) for c in model.calls))
+            _check(results, "端到端：最终答案非空", bool((final or "").strip()))
+        finally:
+            jev_ec.analyze_error_cause_raw = orig_raw
     finally:
         server.shutdown()
 

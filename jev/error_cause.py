@@ -1,28 +1,26 @@
-"""Jev（TypeSafe System One）错因分析工具。
+"""Jev 错因分析工具。
 
 一道错题往往是多因的（既有概念不清又有计算失误），因此一次 system_one 调用里
 组合两类问题并行求解（Jev 不按输出计费，多问题几乎零边际成本）：
 
 1. 一个 Choice 问题：「primary」—— 主错因（单标签，带概率分布/置信度/margin）；
 2. 每个错因一个 Noul 问题：「multi::<错因>」—— 该错因是否存在（概率），
-   按 MULTI_CAUSE_THRESHOLD 阈值汇总为多标签 causes 列表，支撑 idea 里
+   按 MULTI_CAUSE_THRESHOLD 阈值汇总为 detected_causes 多因标签，支撑 idea 里
    「学生易错标签可累加」的需求。
 
-输入 state 由工具按固定模板拼装：题目 / 参考答案 / 学生作答。
+输入 state 由固定模板拼装：题目 / 参考答案 / 学生作答。
 
-降级策略与 jev_tool.classify_question_type 一致：任何异常返回 source=error 的
-结构化 JSON，由 agent 自行分析；低置信/margin 过小/多因为空时标记 needs_review。
+降级策略与 jev/question_type.py 一致：任何异常返回 source=error 的结构化 JSON，
+由 agent 自行分析；低置信/margin 过小/多因为空时标记 needs_review。
 """
+
 from __future__ import annotations
 
 import json
 
 from agents import function_tool
-from jev_tool import (
-    JEV_MODEL,
-    REQUEST_TIMEOUT,
-    make_client,
-)
+
+from .client import JEV_MODEL, REQUEST_TIMEOUT, make_client
 from typesafe_sdk import Choice, Noul
 
 CONFIDENCE_THRESHOLD = 0.70   # 主错因置信度低于该值 -> needs_review

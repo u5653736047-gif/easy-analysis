@@ -34,8 +34,7 @@ from tools import (
     get_current_time,
     summarize_error_types,
 )
-from jev_tool import classify_question_type
-from error_cause_tool import analyze_error_cause
+from jev import analyze_error_cause, classify_question_type
 
 console = Console()
 

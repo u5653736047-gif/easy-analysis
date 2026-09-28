@@ -18,7 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from error_cause_tool import analyze_error_cause_impl
+from jev.error_cause import analyze_error_cause_impl
 
 # (题目, 参考答案, 学生作答, 期望主错因集合, 说明)
 CASES: list[tuple[str, str, str, set[str], str]] = [

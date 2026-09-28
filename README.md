@@ -40,7 +40,7 @@ python main.py --no-reasoning      # 关闭思考链，加快响应
 
 ## Jev 题型分类工具
 
-`jev_tool.py` 把「题干 -> 题型」这一封闭集判断交给 [Jev](https://typesafe.ai)（TypeSafe
+`jev/question_type.py` 把「题干 -> 题型」这一封闭集判断交给 [Jev](https://typesafe.ai)（TypeSafe
 System One 结构化决策模型）：输入题干文本 + 固定选项集，返回选项 + 置信度 + 完整概率分布。
 
 - **固定 taxonomy**：`QUESTION_TYPES`（选择题/判断题/填空题/解答题/证明题/其他），
@@ -62,8 +62,8 @@ COMMAND_CODE_API_KEY=sk-...
 ### 可靠性测试
 
 ```bash
-.venv/bin/python tests/test_jev_tool.py      # 本地假服务：17 项集成/降级断言（无网络依赖）
-.venv/bin/python tests/jev_real_check.py     # 真实 Jev：12 道模拟题评测（需网络）
+.venv/bin/python tests/test_jev_question_type.py   # 本地假服务：17 项断言（无网络依赖）
+.venv/bin/python tests/jev_question_type_real_check.py  # 真实 Jev：12 道模拟题评测
 ```
 
 真实评测初测结果（12 题，含 3 个易混淆用例）：网络可达 12/12，首判准确 10/12，
@@ -72,7 +72,7 @@ COMMAND_CODE_API_KEY=sk-...
 
 ## Jev 错因分析工具
 
-`error_cause_tool.py` 把「一道错题错在哪」交给 Jev：一次 `system_one` 调用里
+`jev/error_cause.py` 把「一道错题错在哪」交给 Jev：一次 `system_one` 调用里
 **并行组合两类问题**（Jev 不按输出计费，多问题几乎零边际成本）：
 
 | 问题 | 原语 | 用途 |
@@ -91,8 +91,8 @@ COMMAND_CODE_API_KEY=sk-...
 ### 可靠性测试
 
 ```bash
-.venv/bin/python tests/test_error_cause_tool.py     # 本地假服务：18 项断言
-.venv/bin/python tests/error_cause_real_check.py    # 真实 Jev：12 道模拟错题评测
+.venv/bin/python tests/test_jev_error_cause.py      # 本地假服务：18 项断言
+.venv/bin/python tests/jev_error_cause_real_check.py  # 真实 Jev：12 道模拟错题评测
 ```
 
 真实评测结果（12 题，8 类错因，含 4 个易混淆/多因用例）：
@@ -107,8 +107,12 @@ COMMAND_CODE_API_KEY=sk-...
 ```
 ├── main.py            # CLI 入口：交互循环、参数解析、API Key 检查
 ├── agent_core.py      # 核心框架：Agent 构建 / 会话 / 流式运行 / 事件渲染
-├── tools.py           # 示例工具（@function_tool）
-├── tests/smoke_test.py  # 冒烟测试（无需 API Key）
+├── tools.py           # 本地工具（@function_tool）
+├── jev/               # Jev 决策工具包
+│   ├── client.py      #   Jev API 共享客户端（配置解析/重试，不含业务逻辑）
+│   ├── question_type.py #  题型分类工具
+│   └── error_cause.py #  错因分析工具（多因标签）
+├── tests/             # 测试（假服务单元测试 + 真实评测）
 ├── requirements.txt   # 依赖清单
 ├── .env.example       # 环境变量模板
 └── conversation_history.db  # 运行时生成的会话历史（已 gitignore）
@@ -135,8 +139,11 @@ COMMAND_CODE_API_KEY=sk-...
 
 ## 如何扩展
 
-- **新增工具**：在 `tools.py` 写一个带类型标注和 docstring 的函数并加 `@function_tool`，
+- **新增本地工具**：在 `tools.py` 写一个带类型标注和 docstring 的函数并加 `@function_tool`，
   然后加入 `build_agent()` 的 `tools` 列表；
+- **新增 Jev 工具**：在 `jev/` 下新建模块，复用 `jev/client.py` 的 `make_client()`，
+  遵循 `*_raw() / *_impl() / @function_tool` 三层结构与 `source/needs_review/hint`
+  降级契约，`.env` 无需任何改动；
 - **改人设/职责**：编辑 `agent_core.AGENT_INSTRUCTIONS`；
 - **换持久化后端**：`create_session()` 目前用 `SQLiteSession`，
   可换成 SDK 提供的 `RedisSession`、`DaprSession` 等，接口不变；

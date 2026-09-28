@@ -1,4 +1,4 @@
-"""Jev（TypeSafe System One）题型分类工具。
+"""Jev 题型分类工具。
 
 把「题干文本 -> 题型」这一封闭集判断交给 Jev 完成：
 - Choice 原语 + 固定 taxonomy（选项内容与顺序均固定，缓解选项顺序敏感性）；
@@ -7,30 +7,23 @@
 - 任何异常（未配置 Key / 网络失败 / 上游 5xx）都返回结构化错误 JSON，
   由 agent 降级为自行判断，工具不抛异常打断主流程。
 
-配置（.env，两套命名均可，Command Code 网关优先）：
-    COMMAND_CODE_API_KEY   + COMMAND_CODE_BASE_URL
-    TYPESAFE_API_KEY       + TYPESAFE_BASE_URL       （官方地址兜底）
-COMMAND_CODE_BASE_URL 形如 https://api.commandcode.ai/provider/v1/systemone，
-SDK 会自动拼接 /v1/systemone，这里需要剥掉该后缀。
-
-重试：SDK 内置 RetryPolicy 对连接错误/超时/429/5xx 退避重试（实测
-Command Code 网络偶发重置，重试后成功率明显提升）。
+结构约定（与 jev/error_cause.py 一致）：
+    *_raw()  只走成功路径，异常上抛；
+    *_impl() 负责阈值加工与异常兜底，返回结构化 dict；
+    @function_tool 只做序列化，交付给 SDK。
 """
+
 from __future__ import annotations
 
 import json
-import os
-import re
-from pathlib import Path
 
 from agents import function_tool
-from typesafe_sdk import Choice, RetryPolicy, TypeSafeClient
 
-JEV_MODEL = "jev-latest"
+from .client import JEV_MODEL, REQUEST_TIMEOUT, make_client
+from typesafe_sdk import Choice
+
 CONFIDENCE_THRESHOLD = 0.70   # 置信度低于该值 -> needs_review
 MARGIN_THRESHOLD = 0.15       # 前两名概率差低于该值 -> needs_review（抗选项顺序敏感）
-REQUEST_TIMEOUT = 30.0        # 单次请求超时（秒）
-MAX_RETRIES = 4               # SDK 内置重试次数
 
 # 固定 taxonomy：内容与顺序都是代码常量，不允许运行时自由发挥
 QUESTION_TYPES: dict[str, str] = {
@@ -42,59 +35,6 @@ QUESTION_TYPES: dict[str, str] = {
     "其他": "以上类型均不符合",
 }
 
-_API_KEY_ENVS = ("COMMAND_CODE_API_KEY", "TYPESAFE_API_KEY")
-_BASE_URL_ENVS = ("COMMAND_CODE_BASE_URL", "TYPESAFE_BASE_URL")
-
-_dotenv_loaded = False
-
-
-def _load_dotenv_once() -> None:
-    """CLI 已加载过 .env 时跳过；独立运行时从当前目录读一次。"""
-    global _dotenv_loaded
-    if _dotenv_loaded:
-        return
-    _dotenv_loaded = True
-    if Path(".env").exists():
-        try:
-            from dotenv import load_dotenv
-
-            load_dotenv(Path(".env"))
-        except Exception:  # noqa: BLE001 - dotenv 不可用时静默降级
-            pass
-
-
-def resolve_jev_config() -> tuple[str | None, str | None]:
-    """返回 (api_key, base_url)。base_url 已剥掉尾部 /v1/systemone 后缀。"""
-    _load_dotenv_once()
-    api_key = next((v for e in _API_KEY_ENVS if (v := os.getenv(e))), None)
-    base_url = next((v for e in _BASE_URL_ENVS if (v := os.getenv(e))), None)
-    if base_url:
-        base_url = re.sub(r"/v1/systemone/?$", "", base_url.rstrip("/"))
-    return api_key, base_url
-
-
-def make_client(
-    *,
-    api_key: str | None = None,
-    base_url: str | None = None,
-    timeout: float = REQUEST_TIMEOUT,
-) -> TypeSafeClient:
-    """构造带重试策略的 Jev 客户端（返回未进入的上下文管理器）。
-
-    api_key/base_url 缺省时从 env 解析；base_url 允许调用方显式指定
-    （测试中用于指向本地假服务）。
-    """
-    if api_key is None:
-        api_key, base_url = resolve_jev_config()
-    client_kwargs: dict = {
-        "api_key": api_key or "unset",
-        "timeout": timeout,
-        "retry": RetryPolicy(max_retries=MAX_RETRIES, backoff_max=8.0),
-    }
-    if base_url:
-        client_kwargs["base_url"] = base_url
-    return TypeSafeClient(**client_kwargs)
-
 
 def classify_question_type_raw(
     question_text: str,
@@ -104,9 +44,6 @@ def classify_question_type_raw(
     timeout: float = REQUEST_TIMEOUT,
 ) -> dict:
     """实际调用 Jev，返回 {type, confidence, probabilities}，异常向上抛。"""
-    if api_key is None and not resolve_jev_config()[0]:
-        raise RuntimeError("未配置 Jev API Key（COMMAND_CODE_API_KEY 或 TYPESAFE_API_KEY）")
-
     with make_client(api_key=api_key, base_url=base_url, timeout=timeout) as client:
         resp = client.system_one(
             state=question_text,

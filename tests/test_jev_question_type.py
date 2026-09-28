@@ -1,7 +1,7 @@
 """Jev 工具测试：本地假 Jev 服务 + 工具逻辑 + 框架内端到端。
 
 运行：
-    .venv/bin/python tests/test_jev_tool.py
+    .venv/bin/python tests/test_jev_question_type.py
 
 两层测试：
 1. 工具逻辑（本地假 Jev 服务，确定性）：高置信 / 低置信 / margin 过小 /
@@ -29,7 +29,7 @@ from agent_core import AGENT_INSTRUCTIONS, AGENT_NAME, chat_streamed
 from agents import Agent, set_tracing_disabled
 from agents.testing import ScriptedModel, assistant_message, function_call
 from agents.tool import function_tool
-from jev_tool import MARGIN_THRESHOLD, QUESTION_TYPES, classify_question_type_raw
+from jev.question_type import MARGIN_THRESHOLD, QUESTION_TYPES, classify_question_type_raw
 from openai.types.responses import ResponseReasoningItem
 from openai.types.responses.response_reasoning_item import Summary
 from rich.console import Console
@@ -99,18 +99,18 @@ def _impl_with_base(question_text: str, base_url: str) -> dict:
     """走 classify_question_type_impl 的真实后处理逻辑，但把请求打到假服务。"""
     raw = classify_question_type_raw
     try:
-        import jev_tool
+        from jev import question_type as jev_qt
 
-        jev_tool.classify_question_type_raw = (
+        jev_qt.classify_question_type_raw = (
             lambda text, *, api_key=None, **kw: raw(
                 text, api_key=api_key or "test-key", base_url=base_url, timeout=15
             )
         )
-        return jev_tool.classify_question_type_impl(question_text)
+        return jev_qt.classify_question_type_impl(question_text)
     finally:
-        import jev_tool
+        from jev import question_type as jev_qt
 
-        jev_tool.classify_question_type_raw = raw
+        jev_qt.classify_question_type_raw = raw
 
 
 # --------------------------------------------------------------------------- #
@@ -195,9 +195,9 @@ async def test_tool_logic(results: list) -> None:
     # --- 场景 6：未配置 Key -> 可读错误 ---
     saved = {k: os.environ.pop(k, None)
              for k in ("COMMAND_CODE_API_KEY", "TYPESAFE_API_KEY")}
-    import jev_tool
+    from jev import client as jev_client
 
-    jev_tool._dotenv_loaded = True  # 阻止重复加载 .env
+    jev_client._dotenv_loaded = True  # 阻止重复加载 .env
     try:
         try:
             classify_question_type_raw("任意题干")
@@ -208,7 +208,7 @@ async def test_tool_logic(results: list) -> None:
         for k, v in saved.items():
             if v is not None:
                 os.environ[k] = v
-        jev_tool._dotenv_loaded = False
+        jev_client._dotenv_loaded = False
     _check(results, "未配置 Key：抛出可读错误", raised)
 
 
@@ -225,61 +225,57 @@ async def test_end_to_end(results: list) -> None:
          "解答题": 0.93, "证明题": 0.03, "其他": 0.0},
     )))
     try:
-        @function_tool
-        def classify_question_type(question_text: str) -> str:
-            """调用 Jev 判定一道题的题型（测试替身，打本地假服务）。"""
-            import json as _json
+        # 直接复用生产工具：只把底层 *_raw 重定向到假服务
+        # ——端到端测的是线上真实代码路径，而不是另写一份替身逻辑
+        from jev import question_type as jev_qt
 
-            r = classify_question_type_raw(
-                question_text, api_key="test-key", base_url=url, timeout=15
+        orig_raw = jev_qt.classify_question_type_raw
+        jev_qt.classify_question_type_raw = (
+            lambda text, *, api_key=None, **kw: orig_raw(
+                text, api_key=api_key or "test-key", base_url=url, timeout=15
             )
-            probs = sorted(r["probabilities"].values(), reverse=True)
-            margin = round(probs[0] - (probs[1] if len(probs) > 1 else 0.0), 4)
-            out = dict(r, margin=margin, source="jev")
-            out["needs_review"] = (
-                out["confidence"] < __import__("jev_tool").CONFIDENCE_THRESHOLD
-                or margin < __import__("jev_tool").MARGIN_THRESHOLD
-            )
-            return _json.dumps(out, ensure_ascii=False)
-
-        model = ScriptedModel([
-            [
-                ResponseReasoningItem(
-                    id="rs-1", type="reasoning",
-                    summary=[Summary(text="先调工具判定题型。", type="summary_text")],
-                ),
-                function_call(
-                    "classify_question_type",
-                    {"question_text": question},
-                    call_id="call-jev-1",
-                ),
-            ],
-            [assistant_message("这道题的题型判定为：解答题。")],
-        ])
-        agent = Agent(
-            name=AGENT_NAME,
-            model=model,
-            instructions=AGENT_INSTRUCTIONS,
-            tools=[classify_question_type],
         )
-
-        recorder = _Recorder()
-        original = agent_core.console
-        agent_core.console = recorder
         try:
-            final = await chat_streamed(agent, f"请判定这道题的题型：{question}")
-        finally:
-            agent_core.console = original
-        text = recorder.export_text()
+            model = ScriptedModel([
+                [
+                    ResponseReasoningItem(
+                        id="rs-1", type="reasoning",
+                        summary=[Summary(text="先调工具判定题型。", type="summary_text")],
+                    ),
+                    function_call(
+                        "classify_question_type",
+                        {"question_text": question},
+                        call_id="call-jev-1",
+                    ),
+                ],
+                [assistant_message("这道题的题型判定为：解答题。")],
+            ])
+            agent = Agent(
+                name=AGENT_NAME,
+                model=model,
+                instructions=AGENT_INSTRUCTIONS,
+                tools=[jev_qt.classify_question_type],
+            )
 
-        _check(results, "端到端：工具被真实调用（假服务收到请求）", len(received) >= 1)
-        _check(results, "端到端：🔧 工具调用已渲染",
-               "🔧 调用工具" in text and "classify_question_type" in text)
-        _check(results, "端到端：📤 工具返回已渲染",
-               "📤 工具返回" in text and "解答题" in text)
-        _check(results, "端到端：工具结果回传给模型",
-               any("0.93" in str(c.input) for c in model.calls))
-        _check(results, "端到端：最终答案非空", bool((final or "").strip()), (final or "")[:30])
+            recorder = _Recorder()
+            original = agent_core.console
+            agent_core.console = recorder
+            try:
+                final = await chat_streamed(agent, f"请判定这道题的题型：{question}")
+            finally:
+                agent_core.console = original
+            text = recorder.export_text()
+
+            _check(results, "端到端：工具被真实调用（假服务收到请求）", len(received) >= 1)
+            _check(results, "端到端：🔧 工具调用已渲染",
+                   "🔧 调用工具" in text and "classify_question_type" in text)
+            _check(results, "端到端：📤 工具返回已渲染",
+                   "📤 工具返回" in text and "解答题" in text)
+            _check(results, "端到端：工具结果回传给模型",
+                   any("0.93" in str(c.input) for c in model.calls))
+            _check(results, "端到端：最终答案非空", bool((final or "").strip()), (final or "")[:30])
+        finally:
+            jev_qt.classify_question_type_raw = orig_raw
     finally:
         server.shutdown()
 
