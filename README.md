@@ -38,6 +38,38 @@ python main.py --no-reasoning      # 关闭思考链，加快响应
 > 或 `API_KEY`/`BASE_URL`/`MODEL_NAME`（后者自动映射为前者）。
 > 端点需支持 Responses API（`/responses`）；使用非官方端点时框架会自动禁用 SDK tracing 上报。
 
+## Jev 题型分类工具
+
+`jev_tool.py` 把「题干 -> 题型」这一封闭集判断交给 [Jev](https://typesafe.ai)（TypeSafe
+System One 结构化决策模型）：输入题干文本 + 固定选项集，返回选项 + 置信度 + 完整概率分布。
+
+- **固定 taxonomy**：`QUESTION_TYPES`（选择题/判断题/填空题/解答题/证明题/其他），
+  内容与顺序都是代码常量，不允许运行时自由发挥（缓解 Jev 的选项顺序敏感性）
+- **needs_review 判定**：置信度 < 0.70 或前两名概率差 margin < 0.15 时标记，
+  提示 agent 复核后再写入结果
+- **自动降级**：未配置 Key / 网络失败 / 上游 5xx 时返回 `source=error` 的结构化 JSON，
+  agent 转为自行判断，主流程不中断（已内置 4 次退避重试）
+- **在框架内的位置**：`build_agent()` 的 tools 列表，走与其它工具完全相同的
+  🔧调用/📤返回 渲染链路
+
+配置（.env，Command Code 网关优先）：
+
+```bash
+COMMAND_CODE_BASE_URL=https://api.commandcode.ai/provider/v1/systemone
+COMMAND_CODE_API_KEY=sk-...
+```
+
+### 可靠性测试
+
+```bash
+.venv/bin/python tests/test_jev_tool.py      # 本地假服务：17 项集成/降级断言（无网络依赖）
+.venv/bin/python tests/jev_real_check.py     # 真实 Jev：12 道模拟题评测（需网络）
+```
+
+真实评测初测结果（12 题，含 3 个易混淆用例）：网络可达 12/12，首判准确 10/12，
+**2 个误判全部被低置信机制捕获**（needs_review 自动降级，不污染结果）。
+注意：Command Code 网络偶发重置，脚本内置 3 次外层重试，平均耗时约 5~7s/题。
+
 ## 目录结构
 
 ```
