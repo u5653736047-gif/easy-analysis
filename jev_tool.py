@@ -73,6 +73,29 @@ def resolve_jev_config() -> tuple[str | None, str | None]:
     return api_key, base_url
 
 
+def make_client(
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    timeout: float = REQUEST_TIMEOUT,
+) -> TypeSafeClient:
+    """构造带重试策略的 Jev 客户端（返回未进入的上下文管理器）。
+
+    api_key/base_url 缺省时从 env 解析；base_url 允许调用方显式指定
+    （测试中用于指向本地假服务）。
+    """
+    if api_key is None:
+        api_key, base_url = resolve_jev_config()
+    client_kwargs: dict = {
+        "api_key": api_key or "unset",
+        "timeout": timeout,
+        "retry": RetryPolicy(max_retries=MAX_RETRIES, backoff_max=8.0),
+    }
+    if base_url:
+        client_kwargs["base_url"] = base_url
+    return TypeSafeClient(**client_kwargs)
+
+
 def classify_question_type_raw(
     question_text: str,
     *,
@@ -81,20 +104,10 @@ def classify_question_type_raw(
     timeout: float = REQUEST_TIMEOUT,
 ) -> dict:
     """实际调用 Jev，返回 {type, confidence, probabilities}，异常向上抛。"""
-    if api_key is None:
-        api_key, base_url = resolve_jev_config()
-    if not api_key:
+    if api_key is None and not resolve_jev_config()[0]:
         raise RuntimeError("未配置 Jev API Key（COMMAND_CODE_API_KEY 或 TYPESAFE_API_KEY）")
 
-    client_kwargs: dict = {
-        "api_key": api_key,
-        "timeout": timeout,
-        "retry": RetryPolicy(max_retries=MAX_RETRIES, backoff_max=8.0),
-    }
-    if base_url:
-        client_kwargs["base_url"] = base_url
-
-    with TypeSafeClient(**client_kwargs) as client:
+    with make_client(api_key=api_key, base_url=base_url, timeout=timeout) as client:
         resp = client.system_one(
             state=question_text,
             questions={

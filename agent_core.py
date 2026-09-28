@@ -35,6 +35,7 @@ from tools import (
     summarize_error_types,
 )
 from jev_tool import classify_question_type
+from error_cause_tool import analyze_error_cause
 
 console = Console()
 
@@ -57,6 +58,12 @@ AGENT_INSTRUCTIONS = """
 - 需要确定某道题的题型时，必须调用 classify_question_type 工具（由 Jev 模型判定）；
 - 工具返回 needs_review=true 时，先结合题干自行复核，再决定是否采信；
 - 工具返回 source=error 时，自行判断题型并在结果中说明降级原因。
+
+错因分析规则：
+- 分析某道错题「错在哪」时，必须调用 analyze_error_cause 工具（由 Jev 模型判定），
+  需要同时提供题目、参考答案、学生作答三项信息；
+- 结果是多因的：detected_causes 列表可同时打多个错因标签，供学生易错标签累加使用；
+- 同样遵循 needs_review 复核与 source=error 降级规则。
 
 回答要求：
 - 使用简体中文，风格专业、简洁、有条理；
@@ -89,7 +96,7 @@ def build_agent(model: str | None = None, *, enable_reasoning: bool = True) -> A
         name=AGENT_NAME,
         model=model_name,
         instructions=AGENT_INSTRUCTIONS,
-        tools=[get_current_time, classroom_score_stats, summarize_error_types, classify_question_type],
+        tools=[get_current_time, classroom_score_stats, summarize_error_types, classify_question_type, analyze_error_cause],
         # reasoning=None 时对非推理模型关闭思考；dict 会被 SDK 解析为 Reasoning 配置
         model_settings=ModelSettings(
             reasoning={"effort": "medium", "summary": "auto"} if enable_reasoning else None

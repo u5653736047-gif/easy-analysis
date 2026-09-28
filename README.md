@@ -70,6 +70,38 @@ COMMAND_CODE_API_KEY=sk-...
 **2 个误判全部被低置信机制捕获**（needs_review 自动降级，不污染结果）。
 注意：Command Code 网络偶发重置，脚本内置 3 次外层重试，平均耗时约 5~7s/题。
 
+## Jev 错因分析工具
+
+`error_cause_tool.py` 把「一道错题错在哪」交给 Jev：一次 `system_one` 调用里
+**并行组合两类问题**（Jev 不按输出计费，多问题几乎零边际成本）：
+
+| 问题 | 原语 | 用途 |
+|---|---|---|
+| `primary` | Choice | 主错因（单标签，带概率分布/置信度/margin） |
+| `multi::<错因>` × 8 | Noul | 每个错因是否存在的概率，按 `MULTI_CAUSE_THRESHOLD`(0.75) 汇总为 `detected_causes` 多因标签 |
+
+输入 state 由固定模板拼装：**题目 / 参考答案 / 学生作答**三段。
+
+- 固定错因 taxonomy（`ERROR_CAUSES`）：概念不清、计算失误、审题不清、方法错误、
+  粗心失误、知识遗忘、表述不完整、其他
+- `detected_causes` 的**多因标签**直接服务「学生易错标签可累加」的产品设计
+- `needs_review` 阈值：主错因置信度 <0.70 或 margin <0.15 或多因为空
+- 降级策略与题型工具一致：异常返回 `source=error`，agent 自行分析
+
+### 可靠性测试
+
+```bash
+.venv/bin/python tests/test_error_cause_tool.py     # 本地假服务：18 项断言
+.venv/bin/python tests/error_cause_real_check.py    # 真实 Jev：12 道模拟错题评测
+```
+
+真实评测结果（12 题，8 类错因，含 4 个易混淆/多因用例）：
+- 主错因判定 7/12；**多因标签覆盖 + needs_review 拦截后，无静默误判**
+  （4 个主错因不一致的被 needs_review 捕获；1 个主错因不同但正确错因在多因标签中）
+- needs_review 触发 9/12——偏保守，适合「标签累加」场景，
+  后续可用更多标注数据微调阈值
+- 平均耗时 7.6s/题（9 个问题一次调用）
+
 ## 目录结构
 
 ```
