@@ -53,22 +53,40 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _check_env() -> bool:
-    """启动前检查 API Key，缺失时给出指引。"""
-    if os.getenv("OPENAI_API_KEY"):
-        return True
-    # 支持从 .env 文件读取
+def _prepare_env() -> bool:
+    """加载 .env，并把第三方常用变量名映射为 SDK 标准变量。
+
+    支持两套变量名：
+    - OpenAI 官方：OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL
+    - 中转/兼容层 ：API_KEY / BASE_URL / MODEL_NAME
+    """
     try:
         from dotenv import load_dotenv
 
         load_dotenv()
     except ImportError:
         pass
+
+    for src, dst in (
+        ("API_KEY", "OPENAI_API_KEY"),
+        ("BASE_URL", "OPENAI_BASE_URL"),
+        ("MODEL_NAME", "OPENAI_MODEL"),
+    ):
+        if os.getenv(src) and not os.getenv(dst):
+            os.environ[dst] = os.environ[src]
+
+    # 非 OpenAI 官方端点时禁用 SDK tracing（否则会尝试上报到 OpenAI ingest 失败并刷屏）
+    base_url = os.getenv("OPENAI_BASE_URL", "")
+    if base_url and "api.openai.com" not in base_url:
+        from agents import set_tracing_disabled
+
+        set_tracing_disabled(True)
+
     if os.getenv("OPENAI_API_KEY"):
         return True
-    console.print("[bold red]✗ 未检测到 OPENAI_API_KEY[/]")
+    console.print("[bold red]✗ 未检测到 API Key[/]")
     console.print("  方式一：export OPENAI_API_KEY=sk-...")
-    console.print("  方式二：复制 .env.example 为 .env 并填入 OPENAI_API_KEY=sk-...")
+    console.print("  方式二：在 .env 中配置 OPENAI_API_KEY=sk-...（或 API_KEY=sk-...）")
     return False
 
 
@@ -114,9 +132,9 @@ async def _run(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    args = parse_args()
-    if not _check_env():
+    if not _prepare_env():
         sys.exit(1)
+    args = parse_args()
     asyncio.run(_run(args))
 
 

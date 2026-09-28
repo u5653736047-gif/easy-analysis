@@ -58,10 +58,13 @@ AGENT_INSTRUCTIONS = """
 - 信息不足时，主动向教师追问，而不是臆测。
 """.strip()
 
-# 思考链的原始事件类型（不同模型/版本会落在其一）
-_REASONING_TYPES = frozenset(
-    {"response.reasoning_summary_text.delta", "response.reasoning_text.delta"}
-)
+def _is_reasoning_delta(etype: str) -> bool:
+    """思考链增量事件的宽松匹配。
+
+    覆盖 response.reasoning_summary_text.delta / response.reasoning_text.delta，
+    也兼容部分中转实现的命名变体；不含 delta 的纯结构事件（part.added 等）不匹配。
+    """
+    return "reasoning" in etype and etype.endswith(".delta")
 
 
 # --------------------------------------------------------------------------- #
@@ -234,7 +237,7 @@ def _render_raw_event(data: Any, r: _StreamRenderer) -> None:
     etype = getattr(data, "type", "")
     item = getattr(data, "item", None)
 
-    if etype in _REASONING_TYPES:
+    if _is_reasoning_delta(etype):
         if delta := getattr(data, "delta", None):
             r.reasoning(delta)
     elif etype == "response.output_text.delta":

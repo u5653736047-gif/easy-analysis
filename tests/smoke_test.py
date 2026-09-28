@@ -30,12 +30,15 @@ from openai.types.responses import (
     ResponseReasoningSummaryTextDeltaEvent,
     ResponseTextDeltaEvent,
 )
+from agents import set_tracing_disabled
 from agents.stream_events import RawResponsesStreamEvent
 from openai.types.responses.response_created_event import ResponseCreatedEvent
 from openai.types.responses.response import Response
 from rich.console import Console
 
 from agents.testing import ScriptedModel, assistant_message, function_call
+
+set_tracing_disabled(True)  # 测试不需要上报 trace，也避免无 Key 时的告警噪音
 
 PASS, FAIL = "\033[32m✓\033[0m", "\033[31m✗\033[0m"
 

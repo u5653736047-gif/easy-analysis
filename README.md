@@ -34,6 +34,10 @@ python main.py --no-reasoning      # 关闭思考链，加快响应
 > 若使用 `gpt-4o` 等非推理模型，框架会正常流式输出答案与工具调用，但没有思考链内容。
 > 默认模型可通过 `OPENAI_MODEL` 或 `--model` 覆盖。
 
+> **关于第三方中转**：`.env` 支持两套变量名，`OPENAI_API_KEY`/`OPENAI_BASE_URL`/`OPENAI_MODEL`
+> 或 `API_KEY`/`BASE_URL`/`MODEL_NAME`（后者自动映射为前者）。
+> 端点需支持 Responses API（`/responses`）；使用非官方端点时框架会自动禁用 SDK tracing 上报。
+
 ## 目录结构
 
 ```
