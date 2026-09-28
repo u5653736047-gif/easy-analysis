@@ -1,10 +1,12 @@
 """「小析易」Agent 基础框架（基于 OpenAI Agents SDK）。
 
-四大能力：
+三大能力：
 1. Agent 构建：人设 + 模型 + 工具                 -> build_agent()
-2. 历史会话：SQLiteSession 持久化                  -> create_session()
-3. 流式运行：Runner.run_streamed() 逐 token 出事件 -> chat_streamed()
-4. 过程渲染：按事件的类型字段分流                  -> _StreamRenderer
+2. 流式运行：Runner.run_streamed() 逐 token 出事件 -> chat_streamed()
+3. 过程渲染：按事件的类型字段分流                  -> _StreamRenderer
+
+历史会话的创建/管理/隔离已移交 session_manager 模块（SessionManager），
+本模块只消费它产出的 SQLiteSession，不再自己碰库。
 
 渲染不依赖 isinstance，全部按事件自身的类型字段分流：
 
@@ -35,6 +37,7 @@ from tools import (
     summarize_error_types,
 )
 from jev import analyze_error_cause, classify_question_type
+from session_manager import DEFAULT_DB  # noqa: F401 - 转发供 CLI --db 默认值使用
 
 console = Console()
 
@@ -104,19 +107,7 @@ def build_agent(model: str | None = None, *, enable_reasoning: bool = True) -> A
 
 
 # --------------------------------------------------------------------------- #
-# 2. 历史会话（SQLite 持久化）
-# --------------------------------------------------------------------------- #
-def create_session(session_id: str, db_path: str | None = None) -> SQLiteSession:
-    """创建/恢复一个会话。
-
-    同一个 session_id 前后两次运行会自动带上历史消息，实现多轮记忆；
-    db_path 指向的 SQLite 文件跨进程保持，重启不丢失。
-    """
-    return SQLiteSession(session_id, db_path or DEFAULT_DB)
-
-
-# --------------------------------------------------------------------------- #
-# 4. 事件渲染器
+# 2. 事件渲染器
 # --------------------------------------------------------------------------- #
 class _StreamRenderer:
     """把流事件按类型分流渲染到控制台。"""

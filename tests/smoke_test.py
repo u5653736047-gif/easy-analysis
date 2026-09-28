@@ -21,7 +21,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import agent_core
-from agent_core import _StreamRenderer, _render_raw_event, build_agent, chat_streamed, create_session
+from agent_core import _StreamRenderer, _render_raw_event, build_agent, chat_streamed
+from session_manager import SessionManager
 from openai.types.responses import (
     ResponseFunctionCallArgumentsDoneEvent,
     ResponseFunctionToolCall,
@@ -182,7 +183,9 @@ def _inject_model(agent, model: ScriptedModel):
 async def test_end_to_end(results: list) -> None:
     print("\n===== 端到端：脚本模型 -> Runner.stream -> SQLiteSession ========")
     tmpdir = tempfile.mkdtemp(prefix="xiaoxiyi-smoke-")
-    session = create_session("smoke", str(Path(tmpdir) / "smoke.db"))
+    mgr = SessionManager(str(Path(tmpdir) / "smoke.db"))
+    mgr.create("smoke")  # 元数据先行；Runner 写消息后由 record_activity 记账
+    session = mgr.open_session("smoke")
 
     original = agent_core.console
     recorder = _Recorder()
@@ -215,6 +218,16 @@ async def test_end_to_end(results: list) -> None:
 
     _check(results, "会话历史第一轮后已写入", items_after_1 >= 4, f"{items_after_1} 条")
     _check(results, "历史消息随轮次增长", items_after_2 >= items_after_1 + 2, f"{items_after_1} -> {items_after_2}")
+
+    # SessionManager 与 Runner 落在同一个库：记账/自动标题/预览应与历史一致
+    mgr.record_activity("smoke", "我上传了本次月考成绩")
+    info = mgr.get("smoke")
+    _check(results, "SessionManager 能读到 Runner 写入的消息数",
+           info is not None and info.message_count == items_after_2,
+           f"meta={info.message_count if info else None} vs history={items_after_2}")
+    _check(results, "首条消息自动生成标题", info is not None and info.title.startswith("我上传了"))
+    _check(results, "预览取自最新消息", info is not None and bool(info.preview))
+    mgr.close()
 
 
 async def main() -> int:

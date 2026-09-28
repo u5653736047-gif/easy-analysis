@@ -10,7 +10,7 @@
 | 流式输出 | `agent_core.chat_streamed()` | `Runner.run_streamed()` 逐 token 返回 `stream_events()` |
 | 思考链展示 | `agent_core._StreamRenderer.reasoning()` | 分流 `response.reasoning_summary_text.delta` / `response.reasoning_text.delta`，灰色流式打印 |
 | 最终答案 | `agent_core._StreamRenderer.content()` | 分流 `response.output_text.delta`，逐 token 打印 |
-| 历史会话 | `agent_core.create_session()` | `SQLiteSession` 持久化到 `conversation_history.db`，重启恢复，按 `session_id` 区分 |
+| 历史会话 | `session_manager.SessionManager` | 与 `SQLiteSession` 共用同一 SQLite 库，元数据/状态机/级联删除/自动标题，重启恢复 |
 | 工具调用展示 | `agent_core._render_raw_event()` | 按 `event.data.type` 分流：`output_item.added` 登记 → `function_call_arguments.done` 打印 🔧 名称+参数（去重）；`tool_output` 事件打印 📤 执行结果 |
 
 ## 快速开始
@@ -105,28 +105,50 @@ COMMAND_CODE_API_KEY=sk-...
 ## 目录结构
 
 ```
-├── main.py            # CLI 入口：交互循环、参数解析、API Key 检查
-├── agent_core.py      # 核心框架：Agent 构建 / 会话 / 流式运行 / 事件渲染
+├── main.py            # CLI 入口：交互循环、会话命令编排
+├── agent_core.py      # 核心框架：Agent 构建 / 流式运行 / 事件渲染
 ├── tools.py           # 本地工具（@function_tool）
 ├── jev/               # Jev 决策工具包
 │   ├── client.py      #   Jev API 共享客户端（配置解析/重试，不含业务逻辑）
 │   ├── question_type.py #  题型分类工具
 │   └── error_cause.py #  错因分析工具（多因标签）
+├── session_manager.py # 会话管理：元数据 / 状态机 / 隔离 / 搜索导出（GUI 直接消费）
 ├── tests/             # 测试（假服务单元测试 + 真实评测）
 ├── requirements.txt   # 依赖清单
 ├── .env.example       # 环境变量模板
 └── conversation_history.db  # 运行时生成的会话历史（已 gitignore）
 ```
 
+> **会话存储为什么是一个库**：`agent_sessions` / `agent_messages` 两表由 SDK 的
+> `SQLiteSession` 读写（Runner 持久化）；`session_meta` 由 `SessionManager` 维护，
+> 通过 `session_id` 外键与前者级联关联——元数据和历史消息永远不会漂移，
+> 删会话时两张表一起清。
+
 ## 交互命令
 
 - `exit` / `quit`：退出
-- `new`：开启新会话（换一个会话 ID，互不影响）
+- `new [标题]`：开启新会话（标题缺省时首条消息自动命名）
+- `sessions [a|d]`：列出会话（默认活跃；a=已归档，d=回收站）
+- `use <会话ID>`：切换到指定会话，历史自动带上
+- `rename <新标题>`：重命名当前会话
+- `history [n]`：查看当前会话最近 n 条对话（默认 10）
+- `search <关键词>`：按标题/摘要搜索会话
+- `archive` / `restore`：归档 / 恢复当前会话
+- `delete`：移入回收站（`restore` 可找回）
+- `export [路径]` / `import <路径>`：导出 / 导入会话 JSON
+- `stats`：会话库统计
+
+会话生命周期：`active -> archived -> active`、`active -> deleted -> active`、
+`deleted -> purge（硬删，消息级联清除，不可恢复）`。
+启动时不指定 `--session` 会自动恢复最近活跃的会话。
 
 ## 测试
 
 ```bash
-.venv/bin/python tests/smoke_test.py
+.venv/bin/python tests/smoke_test.py                # 框架回归（含 SessionManager 记账断言）
+.venv/bin/python tests/test_session_manager.py     # 会话管理：51 项（状态机/隔离/级联/迁移/并发）
+.venv/bin/python tests/test_jev_question_type.py   # 题型工具：17 项
+.venv/bin/python tests/test_jev_error_cause.py     # 错因工具：18 项
 ```
 
 无需真实 API Key：
@@ -145,8 +167,10 @@ COMMAND_CODE_API_KEY=sk-...
   遵循 `*_raw() / *_impl() / @function_tool` 三层结构与 `source/needs_review/hint`
   降级契约，`.env` 无需任何改动；
 - **改人设/职责**：编辑 `agent_core.AGENT_INSTRUCTIONS`；
-- **换持久化后端**：`create_session()` 目前用 `SQLiteSession`，
+- **换持久化后端**：`session_manager.open_session()` 目前返回 `SQLiteSession`，
   可换成 SDK 提供的 `RedisSession`、`DaprSession` 等，接口不变；
 - **多 Agent 协作**：给 `Agent(handoffs=[...])` 加子 Agent 后，在 `chat_streamed()` 的
   事件循环里加一个 `AgentUpdatedStreamEvent` 分支即可渲染切换提示；
-- **接 Web 服务**：`chat_streamed()` 是 async 接口，可直接搬到 FastAPI 的 SSE/WebSocket 路由里。
+- **接 Web 服务**：`chat_streamed()` 是 async 接口，可直接搬到 FastAPI 的 SSE/WebSocket 路由里；
+  `SessionManager` 的所有读接口返回 `SessionInfo`（带 `to_dict()`），可直接序列化为
+  GUI 的会话列表/详情/搜索接口；线程安全（RLock + WAL），GUI 多线程调用无额外处理。
